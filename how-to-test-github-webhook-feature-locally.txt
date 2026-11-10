@@ -1,0 +1,101 @@
+How can we make a connection from our application and GitHub webhook feature locally by using Cloudflare:
+What you can do in the UI
+
+Open this page in aba-web, logged in as a user who can manage the company:
+
+/company/:id/environments/:envId/services/:serviceId/repository
+
+1. Connect repository: enter the owner, repo name and watched branch. A dialog then shows the Payload URL and Secret once, so copy both.
+2. Edit cadence: switch between Instant, Every N pushes and Time interval.
+3. Regenerate secret / Disconnect: the rotate and delete cases.
+4. Results you can see:
+   - The card shows "Last ping" and "Last triggered scan".
+   - In PUSH_COUNT mode it shows the live counter, e.g. 2/3 so far.
+   - In TIME_INTERVAL mode it shows "pending push queued".
+5. Downstream results:
+   - /admin/activity-logs shows the REPOSITORY_SCAN_TRIGGERED event.
+   - /admin/vulnerabilities and the service's package list show the scan findings.
+   - Check Service.lastScannedAt and, if packages are vulnerable, the digest email.
+
+Where the UI stops
+
+The push event has to come from GitHub, and GitHub can't call localhost. The UI has no "send test delivery" button. You have two ways to cover that step:
+
+- A real push through a tunnel (closest to what a customer sees):
+  a. Run cloudflared tunnel --url http://localhost:8000.
+  b. Open the UI through the tunnel URL, or set the webhookUrl host to it. The URL is built from the request host, so use the tunnel host when you click Connect.
+  c. Paste the Payload URL and Secret into your GitHub repo's Settings → Webhooks, with content type application/json and the Pushes and Releases events.
+  d. Run git push to the watched branch. Everything after that is visible in the UI.
+- A simulated delivery, if you don't want to set up a tunnel: run the one curl from my earlier message against the URL the UI gave you. The UI still handles everything else.
+
+GitHub's "Redeliver" button on the webhook's Recent Deliveries tab is the easiest way to repeat a push without making new commits. It also shows the HTTP status your server returned, which is useful for spotting 401/404 bugs.
+
+Suggested UI test order
+
+1. Connect with INSTANT, push, and check that "Last triggered scan" updates and the activity log shows the event.
+2. Set PUSH_COUNT to 3, push 3 times, and watch the counter go 1/3, 2/3, then fire.
+3. Push to a different branch. "Last ping" should update but no scan should fire. Check whether "Last ping" really updates on non-matching pushes, since recordDelivery runs for those.
+4. Regenerate the secret and push again. The old secret should now fail with 401, which you'll see as a red delivery in GitHub.
+5. Disconnect and push. GitHub should show 404.
+
+Do you want me to run the stack and drive the UI with the browser tools to check this for you, or are you going to do the walkthrough yourself?
+
+✻ Crunched for 15s · done 8:39 PM
+
+※ recap: You're checking whether the GitHub webhook-triggered rescan works, using the UI on your local stack. I've laid out the UI steps plus the one part GitHub must do, and I'm waiting for you to pick: I drive the browser, or you test it yourself. (disable recaps in /config)
+
+❯ /model
+  ⎿  Kept model as Sonnet 5.5
+
+❯ I want to test everything myself. the cloudflare part is not also clear to me.
+
+Here's how Cloudflare fits in. It's one extra program that gives your local BFF a temporary public address, because GitHub can't reach localhost. You don't need a Cloudflare account.
+
+Setup (Windows)
+
+1. Install it by running this in PowerShell, then reopening the terminal:
+winget install --id Cloudflare.cloudflared
+2. Start your stack as usual, so aba-bl, aba-web, Kafka, the worker and the database are all running. Check which port aba-bl listens on. Your docs say both 8000 and 3002, so confirm it before the next step.
+3. Start the tunnel in a separate terminal and leave it running. Use your aba-bl port:
+cloudflared tunnel --url http://localhost:8000
+   After a few seconds it prints a line like:
+https://random-words-here.trycloudflare.com
+   Copy that address. It changes every time you restart the tunnel.
+
+Use it with the UI
+
+I need to correct something from my last message. You don't need to open the UI through the tunnel. Keep using http://localhost:3000 as normal.
+
+1. In the UI, click Connect repository. The dialog shows a Payload URL like http://localhost:8000/webhooks/github/<token>.
+2. Copy the Secret too.
+3. Replace only the host part with your tunnel address, keeping the /webhooks/github/<token> path. For example:
+https://random-words-here.trycloudflare.com/webhooks/github/<token>
+4. In your GitHub repo, go to Settings → Webhooks → Add webhook and fill it in:
+   - Payload URL: the edited URL from step 3
+   - Content type: application/json
+   - Secret: the secret from the dialog
+   - Events: "Let me select individual events", then tick Pushes and Releases
+5. Click Add webhook. GitHub immediately sends a ping.
+   - A green tick in Recent Deliveries means the signature check works and the tunnel works.
+   - In the UI, "Last ping" should update after you refresh the page.
+6. Push a commit to the branch you entered in the dialog, then refresh the UI and the admin pages.
+
+If something fails
+
+Open the webhook in GitHub and look at Recent Deliveries. Click a delivery to see the response code, and use Redeliver to resend it.
+
+┌──────────────────────────────────────┬────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
+│             What you see             │                                                                                    Likely cause                                                                                    │
+├──────────────────────────────────────┼────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┤
+│ Can't reach the URL, timeout, or 502 │ The tunnel isn't running, or it points to the wrong port                                                                                                                           │
+├──────────────────────────────────────┼────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┤
+│ 404                                  │ The token in the URL is wrong, or the connection is paused                                                                                                                         │
+├──────────────────────────────────────┼────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┤
+│ 401                                  │ The secret doesn't match. Regenerate it in the UI and update GitHub. If every delivery fails even with the right secret, tell me, because it may be a rawBody setup bug in main.ts │
+├──────────────────────────────────────┼────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┤
+│ 200 but nothing happened             │ Expected for a ping or a push to a different branch. Check the branch name matches exactly, and look at the cadence mode                                                           │
+└──────────────────────────────────────┴────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
+
+Closing the tunnel terminal stops GitHub from reaching you. If you restart it, the address changes, and you must update the Payload URL in GitHub.
+
+Tell me what GitHub's Recent Deliveries shows if anything fails, and I'll help work out whether it's a code bug or a setup issue.

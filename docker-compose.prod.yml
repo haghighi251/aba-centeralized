@@ -1,0 +1,216 @@
+version: "3.8"
+
+# Production compose file. Mirrors docker-compose.dev.yml's real topology
+# (worker + Kafka/Zookeeper + Postgres + Redis) instead of the previous
+# web+api+mongo stub, which was stale — MongoDB was removed from the codebase
+# entirely, and this file never included worker/Kafka/Postgres/Redis at all.
+#
+# This is a "quick path" prod file: it reuses the existing dev Dockerfiles
+# (no separate multi-stage production images exist yet) and just runs them
+# with NODE_ENV=production and no source bind-mounts, so services run the
+# code baked into the image rather than hot-reloading. Concretely this means
+# aba-web still runs via `next dev`, aba-bl via `nest start --watch`, and
+# worker via `ts-node-dev` — functionally correct, but not a fully optimized
+# production build. Re-run `docker compose -f docker-compose.prod.yml up
+# --build` after every code change to pick up new source (no live reload).
+#
+# aba-web and aba-bl ports are bound to 127.0.0.1 only — put a reverse proxy
+# (Nginx/Caddy) on the VPS host in front of them for TLS + the public domain.
+# Postgres/Redis/Kafka/Zookeeper are not published to the host at all.
+services:
+  # ──────────────────────────────────────────────────────────────────────
+  # Frontend (Next.js)
+  # ──────────────────────────────────────────────────────────────────────
+  web:
+    build:
+      context: ./aba-web
+    ports: ["127.0.0.1:3000:3000"]
+    env_file:
+      - ./aba-web/.env.local
+    environment:
+      - NODE_ENV=production
+      - NODE_OPTIONS=--max-old-space-size=2048
+      - PORT=${PORT_WEB:-3000}
+      - NEXT_PUBLIC_API_BASE_URL=http://api:8000
+      - NEXTAUTH_URL=${NEXTAUTH_URL}
+    deploy:
+      resources:
+        limits:
+          memory: 2g
+        reservations:
+          memory: 1g
+    restart: unless-stopped
+
+  # ──────────────────────────────────────────────────────────────────────
+  # Backend API (NestJS BFF)
+  # ──────────────────────────────────────────────────────────────────────
+  api:
+    build:
+      context: .
+      dockerfile: aba-bl/Dockerfile.dev
+    ports: ["127.0.0.1:8000:8000"]
+    env_file:
+      - ./aba-bl/.env.local
+    environment:
+      - NODE_ENV=production
+      - NODE_OPTIONS=--max-old-space-size=2048
+      - PORT=8000
+      - ENCRYPTION_IV=${ENCRYPTION_IV}
+      - ACCESS_TOKEN_SECRET=${ACCESS_TOKEN_SECRET}
+      - REFRESH_TOKEN_SECRET=${REFRESH_TOKEN_SECRET}
+      - GOOGLE_CLIENT_ID=${GOOGLE_CLIENT_ID}
+      - AUTH_GITHUB_ID=${AUTH_GITHUB_ID}
+      - AUTH_GITHUB_SECRET=${AUTH_GITHUB_SECRET}
+      - SMTP_HOST=${SMTP_HOST}
+      - SMTP_PORT=${SMTP_PORT}
+      - SMTP_USER=${SMTP_USER}
+      - SMTP_PASS=${SMTP_PASS}
+      - FRONTEND_URL=${FRONTEND_URL}
+      - DATABASE_URL=postgresql://${PG_USER:-postgres}:${PG_PASSWORD:-postgres}@postgres:5432/${PG_DATABASE:-aba}
+      - PG_HOST=postgres
+      - PG_PORT=5432
+      - PG_USER=${PG_USER}
+      - PG_PASSWORD=${PG_PASSWORD}
+      - PG_DATABASE=${PG_DATABASE}
+      - KAFKA_BROKERS=kafka:9092
+      - RESCAN_POLL_CRON=${RESCAN_POLL_CRON:-0 * * * *}
+      - REDIS_URL=redis://redis:6379
+    deploy:
+      resources:
+        limits:
+          memory: 2g
+        reservations:
+          memory: 1g
+    depends_on:
+      - postgres
+      - redis
+      - kafka
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/api/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+    restart: unless-stopped
+
+  # ──────────────────────────────────────────────────────────────────────
+  # Worker Service (Kafka Consumer: vulnerability fetcher + notification
+  # digest sweep)
+  # ──────────────────────────────────────────────────────────────────────
+  worker:
+    build:
+      context: .
+      dockerfile: worker/Dockerfile
+    ports: ["127.0.0.1:8001:8001"]
+    env_file:
+      - ./worker/.env.local
+    environment:
+      - NODE_ENV=production
+      - NODE_OPTIONS=--max-old-space-size=2048
+      - PORT=8001
+      - DATABASE_URL=postgresql://${PG_USER:-postgres}:${PG_PASSWORD:-postgres}@postgres:5432/${PG_DATABASE:-aba}
+      - PG_HOST=postgres
+      - PG_PORT=5432
+      - PG_USER=${PG_USER}
+      - PG_PASSWORD=${PG_PASSWORD}
+      - PG_DATABASE=${PG_DATABASE}
+      - KAFKA_BROKERS=kafka:9092
+      - REDIS_URL=redis://redis:6379
+      - ENCRYPTION_IV=${ENCRYPTION_IV}
+      - SMTP_HOST=${SMTP_HOST}
+      - SMTP_PORT=${SMTP_PORT}
+      - SMTP_USER=${SMTP_USER}
+      - SMTP_PASS=${SMTP_PASS}
+      - NOTIFICATION_DIGEST_CRON=${NOTIFICATION_DIGEST_CRON:-0 8 * * *}
+      - NOTIFICATION_DIGEST_INTERVAL_HOURS=${NOTIFICATION_DIGEST_INTERVAL_HOURS:-24}
+      - INTERNAL_API_KEY=${INTERNAL_API_KEY}
+    deploy:
+      resources:
+        limits:
+          memory: 1g
+        reservations:
+          memory: 512m
+    depends_on:
+      - postgres
+      - redis
+      - kafka
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8001/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+    restart: unless-stopped
+
+  # ──────────────────────────────────────────────────────────────────────
+  # PostgreSQL — the only datastore (Prisma). Not published to the host.
+  # ──────────────────────────────────────────────────────────────────────
+  postgres:
+    image: postgres:15-alpine
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    environment:
+      - POSTGRES_USER=${PG_USER:-postgres}
+      - POSTGRES_PASSWORD=${PG_PASSWORD:-postgres}
+      - POSTGRES_DB=${PG_DATABASE:-aba}
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${PG_USER:-postgres}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  # ──────────────────────────────────────────────────────────────────────
+  # Kafka Cluster (single broker — fine for a single-VPS deployment)
+  # ──────────────────────────────────────────────────────────────────────
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.5.0
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+      ZOOKEEPER_SYNC_LIMIT: 2
+      ZOOKEEPER_INIT_LIMIT: 5
+    healthcheck:
+      test: ["CMD", "echo", "dump", "|", "nc", "localhost", "2181"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  kafka:
+    image: confluentinc/cp-kafka:7.5.0
+    depends_on:
+      - zookeeper
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+    healthcheck:
+      test: ["CMD", "kafka-broker-api-versions", "--bootstrap-server=localhost:9092"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  # ──────────────────────────────────────────────────────────────────────
+  # Redis — rate limiting, caching. Not published to the host.
+  # ──────────────────────────────────────────────────────────────────────
+  redis:
+    image: redis:7-alpine
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+volumes:
+  postgres_data:
+  redis_data:
+
+networks:
+  default:
+    driver: bridge

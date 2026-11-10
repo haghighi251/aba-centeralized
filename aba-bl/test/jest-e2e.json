@@ -1,0 +1,19 @@
+{
+  "moduleFileExtensions": ["js", "json", "ts"],
+  "rootDir": "..",
+  "testEnvironment": "node",
+  "testRegex": "test/modules/.*\\.e2e-spec\\.ts$",
+  "transform": {
+    "^.+\\.(t|j)s$": "ts-jest"
+  },
+  "moduleNameMapper": {
+    "^@/(.*)$": "<rootDir>/src/$1",
+    "^@modules/(.*)$": "<rootDir>/src/modules/$1",
+    "^@infrastructure/(.*)$": "<rootDir>/src/shared/infrastructure/$1",
+    "^@test/(.*)$": "<rootDir>/test/$1"
+  },
+  "restoreMocks": true,
+  "resetMocks": true,
+  "clearMocks": true,
+  "reporters": ["default", "jest-junit"]
+}

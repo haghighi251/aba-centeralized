@@ -1,0 +1,243 @@
+version: "3.8"
+services:
+  # ──────────────────────────────────────────────────────────────────────
+  # Frontend (Next.js)
+  # ──────────────────────────────────────────────────────────────────────
+  web:
+    build:
+      context: ./aba-web
+    ports: ["3000:3000"]
+    volumes:
+      - ./aba-web:/web
+      - /web/node_modules
+      - /web/.next # Cache Next.js builds
+    env_file:
+      - ./aba-web/.env.local
+    environment:
+      - NODE_ENV=development
+      - NODE_OPTIONS=--max-old-space-size=4096
+      - ENCRYPTION_KEY=${ENCRYPTION_KEY}
+      - PORT=${PORT_WEB}
+      # NEXT_PUBLIC_* is inlined into the browser bundle, so it must be a URL the
+      # browser (on the host) can reach — the published port, not the Docker service name.
+      - NEXT_PUBLIC_API_BASE_URL=http://localhost:8000
+      # Server-side calls made from inside the web container (e.g. next-auth) use the service name.
+      - API_INTERNAL_URL=http://api:8000
+      - NEXTAUTH_URL=http://localhost:3000
+    deploy:
+      resources:
+        limits:
+          memory: 6g
+        reservations:
+          memory: 4g
+
+  # ──────────────────────────────────────────────────────────────────────
+  # Backend API (NestJS BFF)
+  # ──────────────────────────────────────────────────────────────────────
+  api:
+    build:
+      context: .
+      dockerfile: aba-bl/Dockerfile.dev
+    ports: ["8000:8000"]
+    volumes:
+      - ./aba-bl:/app/aba-bl
+      - ./packages/database:/app/packages/database
+      - /app/node_modules
+      - /app/aba-bl/node_modules
+      - /app/packages/database/node_modules
+    env_file:
+      - ./aba-bl/.env.local
+    environment:
+      - NODE_ENV=development
+      - NODE_OPTIONS=--max-old-space-size=2048
+      - PORT=8000
+      - ENCRYPTION_IV=${ENCRYPTION_IV}
+      - ACCESS_TOKEN_SECRET=${ACCESS_TOKEN_SECRET}
+      - REFRESH_TOKEN_SECRET=${REFRESH_TOKEN_SECRET}
+      - GOOGLE_CLIENT_ID=${GOOGLE_CLIENT_ID}
+      - AUTH_GITHUB_ID=${AUTH_GITHUB_ID}
+      - AUTH_GITHUB_SECRET=${AUTH_GITHUB_SECRET}
+      - SMTP_HOST=${SMTP_HOST}
+      - SMTP_PORT=${SMTP_PORT}
+      - SMTP_USER=${SMTP_USER}
+      - SMTP_PASS=${SMTP_PASS}
+      # In Docker, use service names instead of localhost
+      - DATABASE_URL=postgresql://postgres:postgres@postgres:5432/aba
+      - PG_HOST=postgres
+      - PG_PORT=5432
+      - PG_USER=${PG_USER}
+      - PG_PASSWORD=${PG_PASSWORD}
+      - PG_DATABASE=${PG_DATABASE}
+      # Kafka brokers for event streaming
+      - KAFKA_BROKERS=kafka:9092
+      # How often PackageRescanSchedulerService checks for services due a
+      # plan-driven rescan (not the per-plan interval itself)
+      - RESCAN_POLL_CRON=0 * * * *
+      # Redis for rate limiting and caching
+      - REDIS_URL=redis://redis:6379
+      # AI assist (Phase B). Leave ANTHROPIC_API_KEY empty to keep AI disabled.
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
+      - AI_TOKEN_MARGIN=${AI_TOKEN_MARGIN}
+    deploy:
+      resources:
+        limits:
+          memory: 4g
+        reservations:
+          memory: 2g
+    depends_on:
+      - postgres
+      - redis
+      - kafka
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/api/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+  # ──────────────────────────────────────────────────────────────────────
+  # Worker Service (Kafka Consumer, Test Executor, etc.)
+  # ──────────────────────────────────────────────────────────────────────
+  worker:
+    build:
+      context: .
+      dockerfile: worker/Dockerfile
+    ports: ["8001:8001"]
+    volumes:
+      - ./worker:/app/worker
+      - ./packages/database:/app/packages/database
+      - /app/node_modules
+      - /app/worker/node_modules
+      - /app/packages/database/node_modules
+    env_file:
+      - ./worker/.env.local
+    environment:
+      - NODE_ENV=development
+      - NODE_OPTIONS=--max-old-space-size=2048
+      - PORT=8001
+      # In Docker, use service names instead of localhost
+      - DATABASE_URL=postgresql://postgres:postgres@postgres:5432/aba
+      - PG_HOST=postgres
+      - PG_PORT=5432
+      - PG_USER=${PG_USER}
+      - PG_PASSWORD=${PG_PASSWORD}
+      - PG_DATABASE=${PG_DATABASE}
+      # Kafka brokers for consuming test/package events
+      - KAFKA_BROKERS=kafka:9092
+      # Redis for rate limiting token bucket
+      - REDIS_URL=redis://redis:6379
+      - ENCRYPTION_IV=${ENCRYPTION_IV}
+    deploy:
+      resources:
+        limits:
+          memory: 4g
+        reservations:
+          memory: 2g
+    depends_on:
+      - postgres
+      - redis
+      - kafka
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8001/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+  # ──────────────────────────────────────────────────────────────────────
+  # Databases
+  # ──────────────────────────────────────────────────────────────────────
+
+  # PostgreSQL — Primary data store (Prisma) for companies, users, tests, results
+  postgres:
+    image: postgres:15-alpine
+    # Host port remapped to 5433 to avoid clashing with a locally installed Postgres
+    # server on 5432 (which shares the same postgres/postgres credentials and can
+    # silently mislead DB clients like pgAdmin into showing the wrong instance's
+    # data). Containers still reach this service internally via postgres:5432.
+    ports: ["5433:5432"]
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    environment:
+      - POSTGRES_USER=${PG_USER:-postgres}
+      - POSTGRES_PASSWORD=${PG_PASSWORD:-postgres}
+      - POSTGRES_DB=${PG_DATABASE:-aba}
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${PG_USER:-postgres}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # MongoDB — Legacy/secondary data store (Mongoose) for packages, user metadata
+  mongo:
+    image: mongo:6
+    ports: ["27017:27017"]
+    volumes:
+      - mongodb_data:/data/db
+
+  # ──────────────────────────────────────────────────────────────────────
+  # Kafka Cluster (Message Broker)
+  # ──────────────────────────────────────────────────────────────────────
+
+  # Zookeeper — Kafka dependency for broker coordination
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.5.0
+    ports: ["2181:2181"]
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+      ZOOKEEPER_SYNC_LIMIT: 2
+      ZOOKEEPER_INIT_LIMIT: 5
+    healthcheck:
+      test: ["CMD", "echo", "dump", "|", "nc", "localhost", "2181"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # Kafka Broker — Event streaming for test.scheduled, test.result, package.scan, etc.
+  kafka:
+    image: confluentinc/cp-kafka:7.5.0
+    ports: ["9092:9092", "29092:29092"]
+    depends_on:
+      - zookeeper
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092,PLAINTEXT_HOST://localhost:29092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+    healthcheck:
+      test: ["CMD", "kafka-broker-api-versions", "--bootstrap-server=localhost:9092"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ──────────────────────────────────────────────────────────────────────
+  # Caching & Rate Limiting
+  # ──────────────────────────────────────────────────────────────────────
+
+  # Redis — Rate limiting (token bucket), session store, vulnerability caching
+  redis:
+    image: redis:7-alpine
+    ports: ["6379:6379"]
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+# ────────────────────────────────────────────────────────────────────────
+# Persistent Volumes
+# ────────────────────────────────────────────────────────────────────────
+volumes:
+  postgres_data:
+  mongodb_data:
+  redis_data:
+
+# ────────────────────────────────────────────────────────────────────────
+# Networks
+# ────────────────────────────────────────────────────────────────────────
+networks:
+  app_net:
+    driver: bridge

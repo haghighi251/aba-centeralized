@@ -1,0 +1,41 @@
+version: '3.8'
+services:
+  app:
+    build:
+      context: ..
+      dockerfile: aba-bl/Dockerfile.dev
+    ports:
+      - 8000:8000
+    env_file:
+      - ./.env.local
+    environment:
+      - NODE_ENV=development
+      - PORT=8000
+      - ENCRYPTION_IV=47abbe40fc1a67f128d86be66300c9b4
+      - ENCRYPTION_KEY=defaultKey
+      - DATABASE_URL=postgresql://postgres:postgres@postgres:5432/aba
+    depends_on:
+      postgres:
+        condition: service_healthy   # wait until Postgres is actually ready
+  postgres:
+    image: postgres:16
+    ports:
+      - 5432:5432
+    environment:
+      - POSTGRES_USER=postgres
+      - POSTGRES_PASSWORD=postgres
+      - POSTGRES_DB=aba
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:                     # tell Compose when Postgres is ready
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  pgdata:
+    driver: local
+networks:
+  default:
+    driver: bridge

@@ -1,0 +1,31 @@
+{
+  "name": "@aba/database",
+  "version": "1.0.0",
+  "description": "Shared Prisma schema, client, and migrations for the ABA platform",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "scripts": {
+    "build":             "tsc -p tsconfig.json",
+    "db:generate":       "prisma generate",
+    "db:push":           "prisma db push",
+    "db:migrate":        "prisma migrate dev",
+    "db:migrate:deploy": "prisma migrate deploy",
+    "db:migrate:status": "prisma migrate status",
+    "db:studio":         "prisma studio",
+    "db:seed":           "ts-node prisma/seed.ts",
+    "db:backfill-primary-owners": "ts-node prisma/backfillPrimaryOwners.ts",
+    "postinstall":       "prisma generate"
+  },
+  "prisma": {
+    "seed": "ts-node prisma/seed.ts"
+  },
+  "dependencies": {
+    "@prisma/client": "^6.0.0"
+  },
+  "devDependencies": {
+    "@types/node": "^20.14.14",
+    "prisma":     "^6.0.0",
+    "ts-node":    "^10.9.2",
+    "typescript": "^5.5.4"
+  }
+}

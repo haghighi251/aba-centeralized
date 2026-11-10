@@ -1,0 +1,18 @@
+packages:
+  - 'aba-bl'
+  - 'aba-web'
+  - 'worker'
+  - 'packages/*'
+
+# locize-cli (aba-web) pulls "xlsx" from a SheetJS CDN tarball, which pnpm blocks as an exotic subdependency
+allowBuilds:
+  '@nestjs/core': false
+  '@prisma/client': false
+  '@prisma/engines': false
+  '@swc/core': false
+  bcrypt: false
+  esbuild: false
+  prisma: false
+  unrs-resolver: false
+
+blockExoticSubdeps: false

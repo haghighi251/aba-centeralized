@@ -1,0 +1,53 @@
+{
+    "compilerOptions": {
+        "target": "es5",
+        "lib": ["dom", "dom.iterable", "esnext"],
+        "allowJs": true,
+        "skipLibCheck": true,
+        "strict": true,
+        "noEmit": true,
+        "esModuleInterop": true,
+        "module": "esnext",
+        "moduleResolution": "node", // "bundler"
+        "resolveJsonModule": true,
+        "isolatedModules": true,
+        "jsx": "preserve",
+        "incremental": true,
+        "emitDecoratorMetadata": true,
+        "experimentalDecorators": true,
+        "plugins": [
+            {
+                "name": "next"
+            }
+        ],
+        "baseUrl": ".",
+        "paths": {
+            "@/*": ["./src/*"],
+            "@/api/*": ["./src/app/api/*"],
+            "@/tests/*": ["./src/__tests__*"],
+            "@/components/*": ["./src/components/*"],
+            "@/modules/*": ["./src/modules/*"],
+            "@/contexts/*": ["./src/contexts/*"],
+            "@/shared/*": ["./src/shared/*"],
+        },
+        "types": ["jest", "@testing-library/jest-dom"]
+    },
+    "include": [
+        "next-env.d.ts",
+        "**/*.ts",
+        "**/*.tsx",
+        ".next/types/**/*.ts",
+        "src/utils/i18n/server.ts",
+        "src/**/*",
+        "./jest-setup.js",
+    ],
+    "exclude": [
+      "node_modules",
+      "cypress.config.ts",
+      "cypress",
+      "**/*.spec.ts",
+      "**/*.spec.tsx",
+      "**/*.test.ts",
+      "**/*.test.tsx"
+    ]
+}

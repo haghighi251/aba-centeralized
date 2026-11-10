@@ -1,0 +1,1135 @@
+/**
+ * @aba/database — Single source of truth for the ABA platform schema.
+ * IMPORTANT: Only this package may run db:migrate or db:push.
+ * All other services (aba-bl, worker) must only run db:generate
+ * pointing at this file. This prevents accidental schema drift or
+ * data loss from running migrations in the wrong service.
+ * To make a schema change:
+ * cd packages/database
+ * pnpm db:migrate   # creates a migration + updates DB
+ * # Then in aba-bl and worker:
+ * pnpm db:generate  # regenerates the typed client
+ */
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ── Enums ─────────────────────────────────────────────────────────────────────
+
+/**
+ * Platform-level roles (SUPER_ADMIN, ADMIN) manage the entire platform.
+ * Business roles (BUSINESS_*) are scoped to a single company.
+ */
+enum UserRole {
+  SUPER_ADMIN
+  ADMIN
+  BUSINESS_OWNER
+  BUSINESS_ADMIN
+  BUSINESS_MEMBER
+}
+
+enum UserStatus {
+  ACTIVE
+  INACTIVE
+  SUSPENDED
+  PENDING
+}
+
+enum CompanyStatus {
+  ACTIVE
+  INACTIVE
+  SUSPENDED
+  PENDING
+}
+
+/**
+ * Lifecycle status of an environment. ARCHIVED environments are hidden from
+ * the default list and excluded from scheduled test runs / scans, without
+ * losing their historical data.
+ */
+enum EnvironmentStatus {
+  ACTIVE
+  ARCHIVED
+}
+
+/**
+ * Lifecycle status of a team. ARCHIVED teams are hidden from the default
+ * list without losing their historical data.
+ */
+enum TeamStatus {
+  ACTIVE
+  ARCHIVED
+}
+
+/**
+ * Lifecycle status of a service. ARCHIVED services are hidden from the
+ * default list and excluded from scheduled test runs / scans, without
+ * losing their historical data.
+ */
+enum ServiceStatus {
+  ACTIVE
+  ARCHIVED
+}
+
+/**
+ * Ecosystem of a package in the global catalog.
+ */
+enum DependencyEcosystem {
+  NPM
+  PYPI
+  MAVEN
+  RUBYGEMS
+  NUGET
+  GO
+  OTHER
+}
+
+/**
+ * Tracks a ServicePackage row through its lifecycle:
+ * ACTIVE   — currently in use by the service.
+ * STALE    — superseded by a newer version of the same package.
+ * REMOVED  — explicitly removed from the service by a manager.
+ */
+enum ServicePackageStatus {
+  ACTIVE
+  STALE
+  REMOVED
+}
+
+/**
+ * Categorises a Service by its role in the customer's architecture.
+ * OTHER is the catch-all for anything that doesn't fit (mirrors
+ * EnvironmentType.CUSTOM).
+ */
+enum ServiceType {
+  BFF
+  API_GATEWAY
+  MICROSERVICE
+  WORKER
+  FRONTEND
+  DATABASE
+  CACHE
+  MESSAGE_QUEUE
+  OTHER
+}
+
+/**
+ * Pipeline stage type for an Environment. CUSTOM covers any stage that
+ * doesn't fit the standard dev/test/staging/prod pipeline.
+ */
+enum EnvironmentType {
+  DEVELOPMENT
+  TESTING
+  STAGING
+  PRODUCTION
+  PREVIEW
+  DISASTER
+  DEMO
+  SUPPORT
+  EXPERIMENTAL
+  CUSTOM
+}
+
+/**
+ * Source-control provider a ServiceRepositoryConnection watches. GITHUB is
+ * the only one implemented; the enum exists so Bitbucket/GitLab can be added
+ * later without a breaking schema change.
+ */
+enum RepositoryProvider {
+  GITHUB
+  BITBUCKET
+}
+
+/**
+ * Lifecycle status of a ServiceRepositoryConnection.
+ * ACTIVE — inbound webhook events are processed and trigger a rescan.
+ * PAUSED — the connection is kept (secret intact) but events are ignored;
+ *          used when a customer wants to temporarily stop auto-scans
+ *          without losing their webhook configuration.
+ */
+enum RepositoryConnectionStatus {
+  ACTIVE
+  PAUSED
+}
+
+/**
+ * How a ServiceRepositoryConnection turns matching webhook deliveries into
+ * an actual package.scan publish.
+ * INSTANT       — every matching push/release scans immediately.
+ * PUSH_COUNT    — accumulates pendingPushCount and only scans once it
+ *                 reaches pushCountThreshold, then resets to 0.
+ * TIME_INTERVAL — never scans directly from the webhook; a daily sweep
+ *                 (RepositoryTriggerSweepService) scans once intervalDays
+ *                 have passed since the last scan, but only if at least
+ *                 one matching push arrived in the meantime.
+ */
+enum RepositoryTriggerMode {
+  INSTANT
+  PUSH_COUNT
+  TIME_INTERVAL
+}
+
+// ── Models ────────────────────────────────────────────────────────────────────
+
+/**
+ * SubscriptionPlan — a SaaS subscription tier that controls how many
+ * services, environments, and monitored branches a company may use.
+ * null limits mean unlimited. isDefault marks the plan auto-assigned
+ * to newly registered companies (only one plan should have isDefault=true).
+ */
+model SubscriptionPlan {
+  id                   Int      @id @default(autoincrement())
+  name                 String   @unique
+  slug                 String   @unique
+  description          String?
+  maxServices          Int?
+  maxEnvironments      Int?
+  maxMonitoredBranches Int?
+  monthlyPrice         Float
+  yearlyPrice          Float
+  isActive             Boolean  @default(true)
+  isDefault            Boolean  @default(false)
+  // Days between automatic full package rescans promised to companies on
+  // this plan. null = no automatic rescanning (manual scan-on-change only).
+  rescanIntervalDays   Int?
+  // Default cadence offered to a new ServiceRepositoryConnection on a
+  // non-production branch (production branches default to INSTANT
+  // regardless of plan — see RepositoryConnectionService.create() — unless
+  // this is the free tier, i.e. monthlyPrice = 0). null on any of these
+  // three falls back to a hardcoded system default (PUSH_COUNT / 5 / 7),
+  // so existing plan rows need no data migration. Purely a default the
+  // customer can override per-connection at any time.
+  defaultTriggerMode        RepositoryTriggerMode?
+  defaultPushCountThreshold Int?
+  defaultIntervalDays       Int?
+
+  // ── E2E security-testing plan limits (null = unlimited / not offered) ──
+  // Added for the E2E test feature. All nullable/defaulted, so existing plan
+  // rows need no data migration.
+  maxTestPages                  Int?
+  maxTestDefinitions            Int?
+  maxTestRunsPerMonth           Int?
+  allowScheduledTests           Boolean @default(false)
+  /** Floor on how frequently a scheduled test may run, in hours. */
+  minTestScheduleIntervalHours  Int?
+  allowWebhookTests             Boolean @default(false)
+
+  // ── AI assist (Phase B) ──
+  /**
+   * Tokens/month of Claude AI-assist usage included in this plan. null (or 0)
+   * = AI assist is NOT offered on this plan and every AI endpoint reports
+   * disabled. See aba-bl/README.md#ai-assist-token-metering--package-billing.
+   */
+  aiMonthlyTokenAllowance       Int?
+
+  createdAt            DateTime @default(now())
+  updatedAt            DateTime @updatedAt
+
+  companies Company[]
+
+  @@map("subscription_plans")
+}
+
+/**
+ * Company — a customer account that owns environments, services, and users.
+ * SUPER_ADMIN / ADMIN users manage companies via the /admin panel.
+ * BUSINESS_* users access their own company via /company/:id.
+ */
+model Company {
+  id                 Int           @id @default(autoincrement())
+  username           String        @unique
+  email              String        @unique
+  address            String?
+  city               String?
+  state              String?
+  country            String?
+  postalCode         String?
+  website            String?
+  status             CompanyStatus @default(ACTIVE)
+  payAsYouGo         Boolean       @default(false)
+  subscriptionPlanId Int?
+  createdAt          DateTime      @default(now())
+  updatedAt          DateTime      @updatedAt
+
+  /**
+   * The single BUSINESS_OWNER designated as this company's primary contact —
+   * disambiguates "the top admin" when a company has more than one
+   * BUSINESS_OWNER user. Nullable: a company can legitimately have none yet
+   * (surfaced, not hidden, on the companies-with-vulnerabilities admin
+   * screen). SetNull on delete so removing that user account never blocks or
+   * cascades — it just clears the designation.
+   */
+  primaryOwnerId Int?  @unique
+  primaryOwner   User? @relation("CompanyPrimaryOwner", fields: [primaryOwnerId], references: [id], onDelete: SetNull)
+
+  subscriptionPlan SubscriptionPlan? @relation(fields: [subscriptionPlanId], references: [id])
+  users            User[]            @relation("CompanyUsers")
+  environments     Environment[]
+  teams            Team[]
+  services         Service[]
+  aiUsageLogs      AiUsageLog[]
+  aiTokenPurchases AiTokenPurchase[]
+
+  @@index([status])
+  @@index([username])
+  @@index([subscriptionPlanId])
+  @@map("companies")
+}
+
+/**
+ * Team — a group within a Company that owns Environments. The dashboard
+ * hierarchy is company -> teams -> environments -> services.
+ */
+model Team {
+  id          Int        @id @default(autoincrement())
+  name        String
+  slug        String
+  description String?
+  status      TeamStatus @default(ACTIVE)
+  createdAt   DateTime   @default(now())
+  updatedAt   DateTime   @updatedAt
+
+  company   Company @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  companyId Int
+
+  environments Environment[]
+  members      TeamMembership[]
+
+  @@unique([companyId, slug])
+  @@index([companyId])
+  @@index([companyId, status])
+  @@map("teams")
+}
+
+/**
+ * Generic User<->Team membership. Deliberately unconstrained by role at the
+ * schema level — any user can be linked to any team (e.g. so a BUSINESS_OWNER
+ * can assign a newly-invited user to one or more teams). For the vulnerability
+ * notification digest, recipient resolution filters this down to
+ * BUSINESS_ADMIN-role members of the team that owns a given service's
+ * environment; other consumers may use the same table for different role
+ * filters later.
+ */
+model TeamMembership {
+  id        Int      @id @default(autoincrement())
+  createdAt DateTime @default(now())
+
+  user   User @relation(fields: [userId], references: [id], onDelete: Cascade)
+  userId Int
+
+  team   Team @relation(fields: [teamId], references: [id], onDelete: Cascade)
+  teamId Int
+
+  @@unique([userId, teamId])
+  @@index([userId])
+  @@index([teamId])
+  @@map("team_memberships")
+}
+
+/**
+ * Environment — a deployment stage (dev/test/staging/prod/custom) owned by a Team.
+ * Each environment groups the company's Services for that stage and drives
+ * the pipeline-promotion ordering shown in the dashboard.
+ */
+model Environment {
+  id           Int               @id @default(autoincrement())
+  name         String
+  slug         String
+  type         EnvironmentType   @default(CUSTOM)
+  isProduction Boolean           @default(false)
+  order        Int               @default(1)
+  description  String?
+  status       EnvironmentStatus @default(ACTIVE)
+  createdAt    DateTime          @default(now())
+  updatedAt    DateTime          @updatedAt
+
+  company   Company @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  companyId Int
+
+  team   Team @relation(fields: [teamId], references: [id], onDelete: Cascade)
+  teamId Int
+
+  services Service[]
+
+  @@unique([teamId, slug])
+  @@index([companyId])
+  @@index([companyId, status])
+  @@index([teamId])
+  @@index([teamId, order])
+  @@index([teamId, status])
+  @@map("environments")
+}
+
+/**
+ * Service — a micro-service (BFF, API gateway, worker, etc.) registered
+ * under an Environment. Holds the base URL and rate-limit config used by
+ * the Test Executor Worker when running E2E security tests against it.
+ */
+model Service {
+  id              Int           @id @default(autoincrement())
+  name            String
+  slug            String
+  type            ServiceType   @default(OTHER)
+  description     String?
+  baseUrl         String
+  // Shape: { windowMs: number, max: number } - same as worker's ProxyRoute.rateLimit
+  rateLimitConfig Json?
+  status          ServiceStatus @default(ACTIVE)
+  createdAt       DateTime      @default(now())
+  updatedAt       DateTime      @updatedAt
+  // When this service's full active-package set was last completely
+  // rescanned by the plan-driven scheduler. null = never scheduled-rescanned.
+  // Not touched by the manual add/bulk-import scan-on-change path, since that
+  // only checks newly changed packages, not the full set.
+  lastScannedAt   DateTime?
+
+  company   Company @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  companyId Int
+
+  environment   Environment @relation(fields: [environmentId], references: [id], onDelete: Cascade)
+  environmentId Int
+
+  servicePackages ServicePackage[]
+
+  repositoryConnection ServiceRepositoryConnection?
+
+  testPages TestPage[]
+  testRuns  TestRun[]
+
+  @@unique([environmentId, slug])
+  @@index([companyId])
+  @@index([environmentId])
+  @@index([environmentId, status])
+  @@map("services")
+}
+
+/**
+ * A customer's GitHub repository connected to a Service, purely as a
+ * trigger source — we never read their code (no stored read token, no
+ * Contents-API calls). GitHub calls our webhook URL (authenticated only by
+ * HMAC signature over webhookSecretEnc, verified via webhookToken routing)
+ * on a push to watchedBranch or a published release, and we re-scan the
+ * packages already registered for this service — the same active-package
+ * set PackageRescanSchedulerService already uses on its cron tick.
+ * One connection per Service in v1 (serviceId unique).
+ */
+model ServiceRepositoryConnection {
+  id               Int                         @id @default(autoincrement())
+  provider         RepositoryProvider          @default(GITHUB)
+  owner            String
+  name             String
+  watchedBranch    String                      @default("main")
+  // Opaque id embedded in the inbound URL (/webhooks/github/:webhookToken)
+  // used to look up this connection before the HMAC signature is checked.
+  webhookToken     String                      @unique
+  // CryptoService-encrypted HMAC secret. Only ever returned to the customer
+  // in plaintext once, at creation/rotation time.
+  webhookSecretEnc String
+  status           RepositoryConnectionStatus  @default(ACTIVE)
+  // Any verified webhook delivery, matching branch/event or not.
+  lastPingedAt     DateTime?
+  // A verified delivery that actually matched and triggered a rescan.
+  lastTriggeredAt  DateTime?
+  // How matching deliveries turn into a scan — see RepositoryTriggerMode.
+  triggerMode         RepositoryTriggerMode @default(INSTANT)
+  // Used only when triggerMode = PUSH_COUNT.
+  pushCountThreshold  Int?
+  // Used only when triggerMode = TIME_INTERVAL.
+  intervalDays        Int?
+  // Matching pushes since the last actual scan; reset to 0 whenever a scan
+  // fires. For TIME_INTERVAL this also gates the sweep — no scan just
+  // because time passed if nothing actually happened.
+  pendingPushCount    Int @default(0)
+  // When true, a matching webhook delivery also triggers an E2E test run for
+  // the service (Phase 4), alongside the package rescan. Off by default.
+  runE2EOnTrigger     Boolean @default(false)
+  createdAt        DateTime                    @default(now())
+  updatedAt        DateTime                    @updatedAt
+
+  service   Service @relation(fields: [serviceId], references: [id], onDelete: Cascade)
+  serviceId Int     @unique
+
+  connectedBy   User @relation(fields: [connectedById], references: [id])
+  connectedById Int
+
+  @@index([connectedById])
+  @@map("service_repository_connections")
+}
+
+/**
+ * Central catalog of unique package+version combinations across all
+ * companies and services. A single row here is shared by every service
+ * that depends on the same ecosystem/name/version triple, so vulnerability
+ * data fetched once benefits all consumers.
+ */
+model Package {
+  id        Int                 @id @default(autoincrement())
+  ecosystem DependencyEcosystem
+  name      String
+  version   String
+  createdAt DateTime            @default(now())
+
+  servicePackages ServicePackage[]
+  vulnerabilities VulnerabilityOnPackage[]
+
+  // Uniqueness + fast lookup for upsert when parsing a new manifest.
+  @@unique([ecosystem, name, version])
+  /**
+   * Needed when matching vulnerabilities to packages without a specific version
+   * (e.g., “give me all vulnerable packages called express in ecosystem NPM”).
+   * The cronjob and on‑upload scan will filter by (ecosystem, name) and then apply affectedRange logic
+   * in the application.
+   */
+  @@index([ecosystem, name])
+  @@map("packages")
+}
+
+/**
+ * A Service's tracked usage of one Package version over time.
+ * Only one ACTIVE row is allowed per (serviceId, package.name).
+ * When the customer bumps a version the old row becomes STALE
+ * (deactivatedAt is set) and a new ACTIVE row is created.
+ * An explicit delete marks the row REMOVED.
+ */
+model ServicePackage {
+  id            Int                  @id @default(autoincrement())
+  status        ServicePackageStatus @default(ACTIVE)
+  versionRange  String?
+  introducedAt  DateTime             @default(now())
+  deactivatedAt DateTime?
+  alarmCount    Int                  @default(0)
+  lastAlarmAt   DateTime?
+  createdAt     DateTime             @default(now())
+  updatedAt     DateTime             @updatedAt
+
+  service   Service @relation(fields: [serviceId], references: [id], onDelete: Cascade)
+  serviceId Int
+
+  package   Package @relation(fields: [packageId], references: [id])
+  packageId Int
+
+  notificationState ServicePackageNotificationState?
+
+  @@index([serviceId]) // Needed for “show all packages of a service”.
+  @@index([serviceId, status]) // Filtering by active packages for a service (most common query).
+  @@index([packageId]) // Used when linking vulnerabilities to affected services.
+  /**
+   * The critical query: “which services have this package version active?” after a new vulnerability is discovered.
+   * Without it, the consumer must scan all rows with the same packageId, which becomes slow at 100k+ rows.
+   */
+  @@index([packageId, status]) // which services have this package version active?
+  @@map("service_packages")
+}
+
+/**
+ * User — belongs to exactly one company.
+ * Role controls what the user can see and do in the dashboard.
+ * Password is bcrypt-hashed; resetToken is used by the Forgot Password flow.
+ */
+model User {
+  id               Int        @id @default(autoincrement())
+  email            String     @unique
+  password         String
+  firstName        String?
+  lastName         String?
+  phone            String?
+  avatar           String?
+  role             UserRole   @default(BUSINESS_MEMBER)
+  status           UserStatus @default(ACTIVE)
+  lastLogin        DateTime?
+  resetToken       String?
+  resetTokenExpiry DateTime?
+  createdAt        DateTime   @default(now())
+  updatedAt        DateTime   @updatedAt
+
+  company   Company @relation("CompanyUsers", fields: [companyId], references: [id], onDelete: Cascade)
+  companyId Int
+
+  settings UserSettings?
+
+  /**
+   * The company this user is designated the primary owner of, if any.
+   */
+  primaryOwnerOfCompany Company? @relation("CompanyPrimaryOwner")
+
+  teamMemberships TeamMembership[]
+
+  /**
+   * Notification-state rows this user personally muted a package on.
+   */
+  mutedNotificationStates ServicePackageNotificationState[]
+
+  /**
+   * Repository connections this user personally set up (create or rotate).
+   */
+  connectedRepositoryConnections ServiceRepositoryConnection[]
+
+  /**
+   * Manual E2E test runs this user triggered ("Run now").
+   */
+  triggeredTestRuns TestRun[] @relation("UserTriggeredTestRuns")
+
+  @@index([companyId])
+  @@index([email])
+  @@index([role])
+  @@index([companyId, role])
+  @@index([companyId, status])
+  @@map("users")
+}
+
+/**
+ * UserSettings — per-user AI assistant preferences (model, credit, length, history).
+ * One-to-one with User.
+ */
+model UserSettings {
+  id            Int      @id @default(autoincrement())
+  model         String
+  credit        String
+  length        String
+  requestsCount String
+  history       Json?
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+
+  user   User @relation(fields: [userId], references: [id], onDelete: Cascade)
+  userId Int  @unique
+
+  @@map("user_settings")
+}
+
+/**
+ * PricingPackage — AI token pricing tiers (request/response token length & price).
+ * Named distinctly from a future dependency-scanning "Package" concept.
+ */
+model PricingPackage {
+  id                   Int      @id @default(autoincrement())
+  type                 String   @unique
+  requestTokensLength  String
+  requestTokensPrice   String
+  responseTokensLength String
+  responseTokensPrice  String
+  createdAt            DateTime @default(now())
+  updatedAt            DateTime @updatedAt
+
+  @@map("pricing_packages")
+}
+
+/**
+ * Log — application log entries (replaces the legacy Mongo-backed logger).
+ */
+model Log {
+  id        Int      @id @default(autoincrement())
+  level     String
+  message   String
+  context   String?
+  trace     String?
+  timestamp DateTime @default(now())
+
+  @@map("logs")
+}
+
+/**
+ * Post — placeholder model kept for compatibility.
+ * Will be replaced by TestDefinition and TestRun in a future migration.
+ */
+model Post {
+  id        Int      @id @default(autoincrement())
+  title     String
+  content   String?
+  postMeta  String?
+  published Boolean  @default(false)
+  createdAt DateTime @default(now())
+
+  @@map("posts")
+}
+
+/**
+ * Known vulnerability from public databases (OSV, GitHub Advisory, etc.).
+ * Keyed by (ecosystem, packageName, vulnerabilityId) so the same CVE/GHSA
+ * is never stored twice for the same ecosystem.
+ */
+model Vulnerability {
+  id              String              @id @default(uuid())
+  ecosystem       DependencyEcosystem
+  packageName     String
+  vulnerabilityId String // CVE-xxxx-xxxx or GHSA-xxxx-xxxx
+  summary         String?
+  severity        String? // LOW, MEDIUM, HIGH, CRITICAL
+  affectedRange   String? // e.g., ">=1.0.0 <1.2.3"
+  fixedVersion    String? // first patched version
+  publishedAt     DateTime?
+  createdAt       DateTime            @default(now())
+  updatedAt       DateTime            @updatedAt
+
+  packages VulnerabilityOnPackage[]
+
+  @@unique([ecosystem, packageName, vulnerabilityId])
+  @@index([ecosystem, packageName])
+  @@index([vulnerabilityId])
+  @@map("vulnerabilities")
+}
+
+/**
+ * Join table linking Vulnerability to Package (many-to-many).
+ * Supports two critical queries:
+ * "get all packages affected by vulnerability X"  → filter by vulnerabilityId
+ * "get all vulnerabilities for package Y"          → filter by packageId
+ * Combined with ServicePackage, this enables "find all services affected by
+ * vulnerability X" via: vulnerability → packages → servicePackages → services.
+ */
+model VulnerabilityOnPackage {
+  vulnerabilityId String
+  vulnerability   Vulnerability @relation(fields: [vulnerabilityId], references: [id], onDelete: Cascade)
+  packageId       Int
+  package         Package       @relation(fields: [packageId], references: [id], onDelete: Cascade)
+
+  @@id([vulnerabilityId, packageId])
+  @@index([packageId]) // "find all vulns for package Y"
+  @@index([vulnerabilityId]) // "find all packages affected by vuln X"
+  @@map("vulnerability_on_packages")
+}
+
+/**
+ * Which of the two recipient categories a NotificationLog row was sent to.
+ */
+enum NotificationRecipientKind {
+  PRIMARY_OWNER
+  TEAM_BUSINESS_ADMIN
+}
+
+/**
+ * Structured audit-trail event types. Written by both aba-bl (package
+ * actions, views) and worker (notification sent/skipped) — kept as an enum,
+ * not a free string, since both services already regenerate this client from
+ * the same schema.
+ */
+enum ActivityEventType {
+  NOTIFICATION_SENT
+  NOTIFICATION_SKIPPED
+  PACKAGE_VULN_VIEWED
+  PACKAGE_UPDATED
+  PACKAGE_MUTED
+  PACKAGE_UNMUTED
+  PACKAGE_SNOOZED
+  PACKAGE_REMOVED
+  REPOSITORY_CONNECTED
+  REPOSITORY_DISCONNECTED
+  REPOSITORY_SECRET_ROTATED
+  REPOSITORY_SCAN_TRIGGERED
+  REPOSITORY_TRIGGER_SETTINGS_UPDATED
+}
+
+/**
+ * Per-(service,package) notification tracking state — deliberately a
+ * separate table from ServicePackage (not new columns on it) so `worker`'s
+ * daily digest job can be given write access here without ever touching the
+ * ServicePackage row that aba-bl's scan logic owns.
+ * nextNotifyAt/lastNotifiedAt null means "never notified, immediately due."
+ * Rows are only ever updated, never deleted, so history stays coherent.
+ * Cascades with its ServicePackage: once the tracked package itself is gone
+ * (service/environment/company deleted), there's no independent value in
+ * keeping this row — unlike NotificationLog/ActivityLog, which must survive
+ * that deletion for audit purposes and therefore do NOT use a Prisma
+ * relation/FK at all.
+ */
+model ServicePackageNotificationState {
+  id             Int       @id @default(autoincrement())
+  muted          Boolean   @default(false)
+  mutedAt        DateTime?
+  lastNotifiedAt DateTime?
+  nextNotifyAt   DateTime?
+  createdAt      DateTime  @default(now())
+  updatedAt      DateTime  @updatedAt
+
+  servicePackage   ServicePackage @relation(fields: [servicePackageId], references: [id], onDelete: Cascade)
+  servicePackageId Int            @unique
+
+  mutedByUser   User? @relation(fields: [mutedByUserId], references: [id], onDelete: SetNull)
+  mutedByUserId Int?
+
+  @@index([muted])
+  @@index([nextNotifyAt])
+  @@map("service_package_notification_states")
+}
+
+/**
+ * Singleton row (always id=1) used purely as an atomic multi-instance guard
+ * for worker's daily notification digest sweep. The claim is a conditional
+ * UPDATE (`WHERE lastSweptAt IS NULL OR lastSweptAt < now - interval`) —
+ * Postgres row-level locking on that UPDATE makes it safe even if multiple
+ * worker replicas' cron ticks fire around the same time, since only one
+ * transaction's UPDATE can affect the row first; the loser affects zero rows
+ * and skips its run. The seed row is inserted by this model's migration.
+ */
+model NotificationSweepState {
+  id          Int       @id @default(1)
+  lastSweptAt DateTime?
+
+  @@map("notification_sweep_state")
+}
+
+/**
+ * One permanent row per recipient per service per digest actually sent.
+ * Written exclusively by worker's daily sweep. No Prisma relations/FKs to
+ * Company/Service/User on purpose — this must outlive deletion of any of
+ * those entities so the audit trail (and the companies-with-vulnerabilities
+ * admin screen) never silently loses history to a cascade delete elsewhere.
+ * Ids are stored as plain columns; `details` snapshots exactly which
+ * packages/vulnerabilities were included so the row is self-contained even
+ * if the underlying data later changes or is removed.
+ */
+model NotificationLog {
+  id              Int                       @id @default(autoincrement())
+  companyId       Int
+  serviceId       Int
+  sentAt          DateTime                  @default(now())
+  recipientKind   NotificationRecipientKind
+  recipientUserId Int?
+  recipientEmail  String
+  packageCount    Int
+  details         Json
+
+  @@index([companyId, sentAt])
+  @@index([serviceId, sentAt])
+  @@map("notification_logs")
+}
+
+/**
+ * Generic audit trail: "actor did eventType to this entity at this time."
+ * Distinct from the pre-existing `Log` model, which is purely technical/error
+ * logging (level/message/trace) with no actor or entity concept and is left
+ * untouched for that purpose. This is the single table the admin log-browser
+ * screen queries, filterable by company / company+environment / service /
+ * time range / event type. Same no-FK rationale as NotificationLog — audit
+ * history must survive deletion of the entities it references.
+ */
+model ActivityLog {
+  id               Int               @id @default(autoincrement())
+  eventType        ActivityEventType
+  actorUserId      Int?
+  companyId        Int
+  environmentId    Int?
+  serviceId        Int?
+  servicePackageId Int?
+  timestamp        DateTime          @default(now())
+  metadata         Json?
+
+  @@index([companyId, timestamp])
+  @@index([companyId, environmentId, timestamp])
+  @@index([serviceId, timestamp])
+  @@index([eventType, timestamp])
+  @@map("activity_logs")
+}
+
+// ── E2E Security Testing ────────────────────────────────────────────────────
+// Added for the E2E test-execution feature (Data Flow B). A customer registers
+// TestTargets (pages/endpoints) on a Service, attaches TestDefinitions (what to
+// probe + what to assert), and triggers TestRuns (manual now; scheduled and
+// webhook-driven in later phases). The worker executes and streams TestResults
+// back via the test.result topic. See aba-bl/README.md#e2e-security-testing.
+
+/** Category of a test. Decides which executor engine handles it. */
+enum TestType {
+  /** Pre-authored security probe (CSRF, reflected XSS, headers, CORS, SQLi). */
+  GLOBAL_SECURITY
+  /** Customer-defined API request with explicit assertions. */
+  CUSTOM_API
+  /** Browser-rendered page check (needs a DOM). */
+  BROWSER
+}
+
+/** Which runtime executes a TestDefinition in the worker. */
+enum TestEngine {
+  /** Postman CLI (newman-style) collection run — API tests. */
+  POSTMAN
+  /** Playwright — browser-based / global security tests. */
+  PLAYWRIGHT
+}
+
+/** Where a TestDefinition came from (for provenance + UI badges). */
+enum TestDefinitionSource {
+  MANUAL
+  AI_SUGGESTED
+  SWAGGER_IMPORT
+  POSTMAN_IMPORT
+}
+
+/** Lifecycle of a TestPage. ARCHIVED hides it without losing history. */
+enum TestPageStatus {
+  ACTIVE
+  ARCHIVED
+}
+
+/**
+ * The kind of page/endpoint a TestPage represents. Drives AI suggestions and
+ * sensible scenario defaults (e.g. a LOGIN page expects 401 without a token).
+ * CUSTOM/OTHER are the catch-alls.
+ */
+enum TestPageType {
+  LOGIN
+  REGISTER
+  CHECKOUT
+  SEARCH
+  PROFILE
+  CONTACT
+  LANDING
+  DASHBOARD
+  API_ENDPOINT
+  CUSTOM
+  OTHER
+}
+
+/**
+ * How a TestPage authenticates when probed. The actual secret lives,
+ * encrypted, in TestPage.authSecretEnc — never in accessConfig or on Kafka.
+ */
+enum TestAuthKind {
+  NONE
+  BEARER_TOKEN
+  API_KEY_HEADER
+  BASIC
+}
+
+/** What kicked off a TestRun. */
+enum TestRunTrigger {
+  MANUAL
+  SCHEDULED
+  WEBHOOK
+}
+
+/** Lifecycle of a TestRun. */
+enum TestRunStatus {
+  QUEUED
+  RUNNING
+  PASSED
+  FAILED
+  ERROR
+  CANCELLED
+}
+
+/** Outcome of a single TestResult within a run. */
+enum TestResultStatus {
+  PASSED
+  FAILED
+  ERROR
+  SKIPPED
+}
+
+/**
+ * A page or endpoint of a Service that the customer wants security-tested.
+ * `path` is resolved against Service.baseUrl unless `absoluteUrl` is set.
+ * A page can host several forms; each TestDefinition targets one of them.
+ */
+model TestPage {
+  id          Int            @id @default(autoincrement())
+  name        String
+  description String?
+  pageType    TestPageType   @default(CUSTOM)
+  /** Path relative to Service.baseUrl, e.g. "/api/login". */
+  path        String?
+  /** Full URL; takes precedence over path when set. */
+  absoluteUrl String?
+  /** Default HTTP method for custom-API definitions on this page. */
+  method      String         @default("GET")
+  status      TestPageStatus @default(ACTIVE)
+
+  // ── Access / posture (non-secret) ──
+  // Shape: { tokenRequired?: boolean, expectedStatusWithoutAuth?: number,
+  //          customHeaders?: {k:v}, ipAllowlist?: string[],
+  //          requestValiditySeconds?: number, notes?: string }. Posture the
+  //          tests assert against; never holds the credential itself.
+  accessConfig Json?
+  authKind     TestAuthKind @default(NONE)
+  /** CryptoService-encrypted auth material. Returned to the worker only via
+   *  the internal materials endpoint, never over Kafka. Never sent to clients. */
+  authSecretEnc String?
+
+  // ── Scheduling (Phase 3 — forward-declared so no second migration) ──
+  scheduleEnabled       Boolean   @default(false)
+  scheduleIntervalHours Int?
+  nextScheduledAt       DateTime?
+
+  // ── Webhook (Phase 4) ──
+  runOnWebhook Boolean @default(false)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  service   Service @relation(fields: [serviceId], references: [id], onDelete: Cascade)
+  serviceId Int
+
+  testDefinitions TestDefinition[]
+  testRuns        TestRun[]
+
+  @@index([serviceId])
+  @@index([serviceId, status])
+  @@map("test_pages")
+}
+
+/**
+ * A single test attached to a TestPage: what request/probe to run and what
+ * to assert about the response (including negative "must-not-access" checks).
+ */
+model TestDefinition {
+  id     Int                  @id @default(autoincrement())
+  name   String
+  type   TestType
+  engine TestEngine
+  source TestDefinitionSource @default(MANUAL)
+  /** Identifies a GLOBAL_SECURITY template (e.g. "csrf", "xss-reflected",
+   *  "security-headers"); null for custom tests. */
+  templateKey String?
+  enabled     Boolean @default(true)
+
+  // Shape: {
+  //   method?, pathOverride?, headers?:{k:v}, query?:{k:v},
+  //   contentType?: "json" | "form-urlencoded" | "multipart",
+  //   // Form simulator: the specific form on the page this test targets.
+  //   form?: { name?: string, fields: [{ name, type, value?, secret? }] },
+  //   body?  // raw body, used when no form is given
+  // }. Field `type` is one of text/password/email/number/checkbox/hidden/
+  //    captcha/textarea/select (UI hint; all serialised as strings).
+  config Json?
+  // Shape: { status?: number|number[], headers?: {k: string|regex},
+  //          jsonPath?: [{ path, equals?/exists?/matches? }],
+  //          bodyContains?: string[], negative?: boolean }.
+  assertions Json?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  testPage   TestPage @relation(fields: [testPageId], references: [id], onDelete: Cascade)
+  testPageId Int
+
+  testResults TestResult[]
+
+  @@index([testPageId])
+  @@index([testPageId, enabled])
+  @@map("test_definitions")
+}
+
+/**
+ * One execution of a Service's (or a single target's) enabled definitions.
+ * `runKey` correlates the test.scheduled publish with the test.result reply,
+ * exactly like PackageScanMessage.scanId does for the scan pipeline.
+ */
+model TestRun {
+  id      Int            @id @default(autoincrement())
+  runKey  String         @unique
+  trigger TestRunTrigger @default(MANUAL)
+  status  TestRunStatus  @default(QUEUED)
+
+  totalCount  Int @default(0)
+  passedCount Int @default(0)
+  failedCount Int @default(0)
+  errorCount  Int @default(0)
+
+  startedAt  DateTime?
+  finishedAt DateTime?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  service   Service @relation(fields: [serviceId], references: [id], onDelete: Cascade)
+  serviceId Int
+
+  /** Null = ran every active page on the service. */
+  testPage   TestPage? @relation(fields: [testPageId], references: [id], onDelete: SetNull)
+  testPageId Int?
+
+  /** User who clicked "Run now"; null for scheduled/webhook runs. */
+  triggeredBy   User? @relation("UserTriggeredTestRuns", fields: [triggeredById], references: [id], onDelete: SetNull)
+  triggeredById Int?
+
+  results TestResult[]
+
+  @@index([serviceId, createdAt])
+  @@index([status])
+  @@map("test_runs")
+}
+
+/** Outcome of one TestDefinition inside a TestRun. */
+model TestResult {
+  id     Int              @id @default(autoincrement())
+  /** Snapshot of the definition name at run time (survives later edits). */
+  name   String
+  status TestResultStatus
+  durationMs Int?
+
+  // Request actually sent (method, url, headers minus secrets, body).
+  request Json?
+  // Response summary (status, headers, truncated body).
+  response Json?
+  // Per-assertion outcomes: [{ assertion, passed, expected, actual, message }].
+  assertionResults Json?
+  errorMessage     String?
+
+  createdAt DateTime @default(now())
+
+  testRun   TestRun @relation(fields: [testRunId], references: [id], onDelete: Cascade)
+  testRunId Int
+
+  testDefinition   TestDefinition? @relation(fields: [testDefinitionId], references: [id], onDelete: SetNull)
+  testDefinitionId Int?
+
+  @@index([testRunId])
+  @@map("test_results")
+}
+
+// ── AI assist (Phase B) ────────────────────────────────────────────────────
+
+/** Which on-demand Claude AI-assist feature a usage row / request is for. */
+enum AiAssistFeature {
+  SUGGEST_TESTS
+  EXPLAIN_RUN
+  IMPROVE_TEST
+}
+
+/**
+ * One metered Claude API call. The token allowance pool is token-denominated:
+ * `inputTokens + outputTokens` is what decrements a company's remaining
+ * allowance (see AiMeteringService). `costMicroUsd` is the real provider spend
+ * (buy cost) recorded for margin reporting only, not for gating.
+ */
+model AiUsageLog {
+  id           Int             @id @default(autoincrement())
+  company      Company         @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  companyId    Int
+  feature      AiAssistFeature
+  model        String
+  inputTokens  Int             @default(0)
+  outputTokens Int             @default(0)
+  /** Provider cost of this call in micro-USD (1e-6 USD), from buy-price config. */
+  costMicroUsd Int             @default(0)
+  /** Optional triggering user, for the activity view. */
+  userId       Int?
+  createdAt    DateTime        @default(now())
+
+  @@index([companyId, createdAt])
+  @@map("ai_usage_logs")
+}
+
+/**
+ * An AI-token top-up credited to a company. In this phase there is no payment
+ * gateway: rows are created by the internal grant endpoint (admin tooling).
+ * `tokens` adds to the company's remaining allowance in the period it was
+ * granted.
+ */
+model AiTokenPurchase {
+  id           Int      @id @default(autoincrement())
+  company      Company  @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  companyId    Int
+  tokens       Int
+  pricePaidUsd Float    @default(0)
+  note         String?
+  createdAt    DateTime @default(now())
+
+  @@index([companyId, createdAt])
+  @@map("ai_token_purchases")
+}

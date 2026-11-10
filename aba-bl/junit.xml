@@ -1,0 +1,29 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<testsuites name="jest tests" tests="11" failures="0" errors="0" time="44.391">
+  <testsuite name="AiAssistController" errors="0" failures="0" skipped="0" timestamp="2026-11-08T12:00:15" time="43.155" tests="5">
+    <testcase classname="AiAssistController status wraps the use-case result in the standard response" name="AiAssistController status wraps the use-case result in the standard response" time="0.171">
+    </testcase>
+    <testcase classname="AiAssistController suggest forwards params + body and the requesting user id" name="AiAssistController suggest forwards params + body and the requesting user id" time="0.007">
+    </testcase>
+    <testcase classname="AiAssistController explain forwards the run id and user id" name="AiAssistController explain forwards the run id and user id" time="0.004">
+    </testcase>
+    <testcase classname="AiAssistController improve forwards ids, instructions and user id" name="AiAssistController improve forwards ids, instructions and user id" time="0.004">
+    </testcase>
+    <testcase classname="AiAssistController defaults userId to null when no authenticated user is present" name="AiAssistController defaults userId to null when no authenticated user is present" time="0.013">
+    </testcase>
+  </testsuite>
+  <testsuite name="AnthropicClientService" errors="0" failures="0" skipped="0" timestamp="2026-11-08T12:00:59" time="1" tests="6">
+    <testcase classname="AnthropicClientService isConfigured is true when ANTHROPIC_API_KEY is set" name="AnthropicClientService isConfigured is true when ANTHROPIC_API_KEY is set" time="0.004">
+    </testcase>
+    <testcase classname="AnthropicClientService isConfigured is false when ANTHROPIC_API_KEY is empty/unset" name="AnthropicClientService isConfigured is false when ANTHROPIC_API_KEY is empty/unset" time="0.002">
+    </testcase>
+    <testcase classname="AnthropicClientService complete sends the request and returns concatenated text + usage" name="AnthropicClientService complete sends the request and returns concatenated text + usage" time="0.002">
+    </testcase>
+    <testcase classname="AnthropicClientService complete omits output_config when no effort is given" name="AnthropicClientService complete omits output_config when no effort is given" time="0.002">
+    </testcase>
+    <testcase classname="AnthropicClientService complete defaults token counts to 0 when usage is missing" name="AnthropicClientService complete defaults token counts to 0 when usage is missing" time="0.003">
+    </testcase>
+    <testcase classname="AnthropicClientService complete reuses a single client instance across calls" name="AnthropicClientService complete reuses a single client instance across calls" time="0.009">
+    </testcase>
+  </testsuite>
+</testsuites>
